@@ -1,0 +1,123 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Exercice;
+use App\Models\Lecon;
+use App\Services\GeminiService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
+
+class IAController extends Controller
+{
+    private $geminiService;
+
+    public function __construct(GeminiService $geminiService)
+    {
+        $this->geminiService = $geminiService;
+    }
+
+    public function poserQuestion(Request $request)
+{
+    $validator = Validator::make($request->all(), [
+        'lecon_id' => 'required|exists:lecons,id',
+        'question' => 'required|string|max:500',
+    ]);
+
+    if ($validator->fails()) {
+        return response()->json(['errors' => $validator->errors()], 422);
+    }
+
+    try {
+        $lecon = Lecon::with('chapitre.niveau')->findOrFail($request->lecon_id);
+        
+        // EXTRAIRE LE CONTENU RÉEL DE LA LEÇON
+        $contenuHtml = $lecon->contenu_html ?? '';
+        
+        // Nettoyer et extraire le texte
+        $contenuTexte = strip_tags($contenuHtml);
+        $contenuTexte = html_entity_decode($contenuTexte);
+        $contenuTexte = preg_replace('/\s+/', ' ', $contenuTexte);
+        $contenuTexte = trim($contenuTexte);
+        
+        // Limiter à 2500 caractères pour ne pas surcharger
+        if (strlen($contenuTexte) > 2500) {
+            $contenuTexte = substr($contenuTexte, 0, 2500) . '...';
+        }
+        
+        // Créer le contexte
+        $contexteCours = "=== LEÇON : {$lecon->titre} ===\n\n";
+        
+        if ($lecon->resume) {
+            $contexteCours .= "RÉSUMÉ : {$lecon->resume}\n\n";
+        }
+        
+        $contexteCours .= "CONTENU DÉTAILLÉ :\n{$contenuTexte}";
+        
+        // Log pour debug
+        \Log::info('Contexte envoyé à l\'IA:', [
+            'longueur' => strlen($contexteCours),
+            'question' => $request->question,
+            'preview' => substr($contexteCours, 0, 200)
+        ]);
+        
+        $niveau = $lecon->chapitre->niveau->nom ?? 'Sixième';
+        
+        $reponse = $this->geminiService->repondreQuestion(
+            $request->question,
+            $contexteCours,
+            $niveau
+        );
+        
+        return response()->json([
+            'reponse' => $reponse,
+            'lecon' => $lecon->titre,
+        ]);
+        
+    } catch (\Exception $e) {
+        \Log::error('Erreur IA:', ['error' => $e->getMessage()]);
+        
+        return response()->json([
+            'error' => 'Erreur lors du traitement de votre question',
+            'message' => $e->getMessage()
+        ], 500);
+    }
+}
+
+    public function feedbackExercice(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'exercice_id' => 'required|exists:exercices,id',
+            'reponse_eleve' => 'required',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['errors' => $validator->errors()], 422);
+        }
+
+        $exercice = Exercice::with('correction', 'lecon.chapitre.niveau')
+            ->findOrFail($request->exercice_id);
+
+        if (! $exercice->correction) {
+            return response()->json([
+                'message' => 'Aucune correction disponible pour cet exercice.',
+            ], 404);
+        }
+
+        $reponseCorrecte = $exercice->correction->reponse_correcte;
+        $niveau = $exercice->lecon?->chapitre?->niveau?->nom ?? 'non spécifié';
+
+        $feedback = $this->geminiService->analyserErreur(
+            $exercice->enonce,
+            json_encode($request->reponse_eleve),
+            is_array($reponseCorrecte) ? json_encode($reponseCorrecte) : (string) $reponseCorrecte,
+            $niveau
+        );
+
+        return response()->json([
+            'feedback' => $feedback,
+            'explication' => $exercice->correction->explication,
+        ]);
+    }
+}

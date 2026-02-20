@@ -1,0 +1,104 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\PerformanceEleve;
+use App\Models\ProgressionLecon;
+use App\Models\ReponseEleve;
+use App\Services\GroqService;
+use Illuminate\Http\Request;
+
+class DashboardController extends Controller
+{
+    private $groqService;
+
+    public function __construct(GroqService $groqService)
+    {
+        $this->groqService = $groqService;
+    }
+
+    public function index(Request $request)
+    {
+        $eleve = $request->user()->load('niveau');
+
+        try {
+            $statsGlobales = [
+                'total_lecons_terminees' => ProgressionLecon::where('eleve_id', $eleve->id)
+                    ->where('statut', 'termine')
+                    ->count(),
+                'total_exercices_faits' => ReponseEleve::where('eleve_id', $eleve->id)
+                    ->count(),
+                'total_corrects' => ReponseEleve::where('eleve_id', $eleve->id)
+                    ->where('est_correcte', true)
+                    ->count(),
+                'temps_total_minutes' => ProgressionLecon::where('eleve_id', $eleve->id)
+                    ->sum('temps_passe') / 60,
+            ];
+
+            $statsGlobales['taux_reussite_global'] = $statsGlobales['total_exercices_faits'] > 0
+                ? round(($statsGlobales['total_corrects'] / $statsGlobales['total_exercices_faits']) * 100, 1)
+                : 0;
+        } catch (\Throwable $e) {
+            $statsGlobales = [
+                'total_lecons_terminees' => 0,
+                'total_exercices_faits' => 0,
+                'total_corrects' => 0,
+                'temps_total_minutes' => 0,
+                'taux_reussite_global' => 0,
+            ];
+        }
+
+        try {
+            $parMatiere = PerformanceEleve::where('eleve_id', $eleve->id)
+                ->with('matiere')
+                ->get()
+                ->map(function ($perf) {
+                    return [
+                        'matiere' => $perf->matiere,
+                        'niveau_global' => $perf->niveau_global,
+                        'taux_reussite' => $perf->taux_reussite,
+                        'points_forts' => $perf->points_forts,
+                        'points_faibles' => $perf->points_faibles,
+                    ];
+                });
+        } catch (\Throwable $e) {
+            $parMatiere = collect([]);
+        }
+
+        try {
+            $activiteRecente = ReponseEleve::where('eleve_id', $eleve->id)
+                ->with('exercice.lecon')
+                ->orderBy('created_at', 'desc')
+                ->limit(10)
+                ->get()
+                ->map(function ($reponse) {
+                    return [
+                        'type' => 'exercice',
+                        'lecon' => $reponse->exercice?->lecon?->titre ?? 'Leçon',
+                        'est_correcte' => $reponse->est_correcte,
+                        'date' => $reponse->created_at->diffForHumans(),
+                    ];
+                });
+        } catch (\Throwable $e) {
+            $activiteRecente = collect([]);
+        }
+
+        $recommandationsIA = $this->groqService->genererRecommandations(
+            [
+                'stats_globales' => $statsGlobales,
+                'par_matiere' => $parMatiere->toArray(),
+            ],
+            $eleve->niveau?->nom ?? 'non spécifié',
+            $eleve->prenom
+        );
+
+        return response()->json([
+            'eleve' => $eleve,
+            'stats_globales' => $statsGlobales,
+            'par_matiere' => $parMatiere,
+            'activite_recente' => $activiteRecente,
+            'recommandations_ia' => $recommandationsIA,
+        ]);
+    }
+}
